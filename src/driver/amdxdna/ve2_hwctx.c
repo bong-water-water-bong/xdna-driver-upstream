@@ -203,9 +203,7 @@ hsa_queue_reserve_slot(struct amdxdna_dev *xdna, struct amdxdna_ctx_priv *priv, 
 
 	/* Reserve this slot by incrementing reserved_write_index. */
 	*slot = queue->reserved_write_index++;
-	queue->hq_complete.hqc_mem[slot_idx] = ERT_CMD_STATE_NEW;
-	/* Sync completion memory after writing (device will read) */
-	hsa_queue_sync_completion_for_write(queue, slot_idx);
+	clear_bit(slot_idx, queue->slot_ready);
 
 	mutex_unlock(&queue->hq_lock);
 
@@ -232,19 +230,14 @@ static void hsa_queue_commit_slot(struct amdxdna_dev *xdna, struct amdxdna_ctx *
 	/* Sync packet after writing (device will read) */
 	hsa_queue_sync_packet_for_write(queue, slot_idx);
 
-	/* Mark this seq as ready in driver tracking */
-	queue->hq_complete.hqc_mem[slot_idx] = ERT_CMD_STATE_SUBMITTED;
-	/* Sync completion memory after writing (device will read) */
-	hsa_queue_sync_completion_for_write(queue, slot_idx);
+	/* Mark slot ready in driver-local tracking (cert owns hqc_mem) */
+	set_bit(slot_idx, queue->slot_ready);
 
 	/* Advance write_index as far as possible through all ready slots. */
 	while (header->write_index < queue->reserved_write_index) {
 		u32 next_idx = header->write_index % capacity;
-		/* Sync completion memory before reading (device may have written) */
-		hsa_queue_sync_completion_for_read(queue, next_idx);
-		enum ert_cmd_state state = queue->hq_complete.hqc_mem[next_idx];
 
-		if (state != ERT_CMD_STATE_SUBMITTED)
+		if (!test_bit(next_idx, queue->slot_ready))
 			break;
 
 		header->write_index++;
@@ -582,10 +575,19 @@ static int ve2_create_host_queue(struct amdxdna_dev *xdna, struct amdxdna_ctx *h
 		}
 	}
 
+	/* Zero hqc_mem so physical memory starts clean for cert's completion writes */
+	memset(queue->hq_complete.hqc_mem, 0, sizeof(u64) * HOST_QUEUE_ENTRY);
+
 	/* Sync entire queue structure after initialization (device will read) */
 	dma_sync_single_for_device(queue->alloc_dev,
 				   queue->hsa_queue_mem.dma_addr,
 				   sizeof(struct hsa_queue),
+				   DMA_TO_DEVICE);
+
+	/* Sync hqc_mem to device so physical memory is clean before cert writes */
+	dma_sync_single_for_device(queue->alloc_dev,
+				   queue->hq_complete.hqc_dma_addr,
+				   sizeof(u64) * HOST_QUEUE_ENTRY,
 				   DMA_TO_DEVICE);
 
 	XDNA_DBG(xdna, "Created host queue: dma_addr=0x%llx, capacity=%d, data_addr=0x%llx",
