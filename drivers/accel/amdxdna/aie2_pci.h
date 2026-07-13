@@ -210,6 +210,7 @@ extern const struct dpm_clk_freq npu1_dpm_clk_table[];
 extern const struct dpm_clk_freq npu4_dpm_clk_table[];
 extern const struct rt_config npu1_default_rt_cfg[];
 extern const struct rt_config npu4_default_rt_cfg[];
+extern bool fw_patches_enable;
 extern const struct amdxdna_fw_feature_tbl npu4_fw_feature_table[];
 extern const struct amdxdna_rev_vbnv npu4_rev_vbnv_tbl[];
 extern const struct aie_hw_ops npu4_hw_ops;

@@ -386,6 +386,7 @@ int aie2_runtime_cfg(struct amdxdna_dev_hdl *ndev,
 #define AIE2_BIT_BYPASS_SET_FREQ	1
 #define AIE2_BIT_BYPASS_FW_LOAD		2 /* NOSYS */
 extern uint aie2_control_flags;
+extern bool fw_patches_enable;
 extern const struct amdxdna_dev_ops aie2_ops;
 int aie2_check_protocol(struct amdxdna_dev_hdl *ndev, u32 fw_major, u32 fw_minor);
 

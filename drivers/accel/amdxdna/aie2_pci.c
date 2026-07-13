@@ -238,7 +238,20 @@ static int aie2_mgmt_fw_query(struct amdxdna_dev_hdl *ndev)
 		return ret;
 	}
 
-	ndev->total_col = min(aie2_max_col, ndev->aie.metadata.cols);
+	/*
+	 * When firmware patching is enabled (fw_patches_enable=1), use the
+	 * module parameter directly -- the firmware has been patched in-memory
+	 * to expose 40 columns, so the driver must match.
+	 * Without patching, clamp to what firmware reports.
+	 * Default aie2_max_col = XRS_MAX_COL (128); set it explicitly, e.g.:
+	 *   modprobe amdxdna aie2_max_col=40
+	 */
+	if (fw_patches_enable)
+		ndev->total_col = aie2_max_col;
+	else
+		ndev->total_col = min(aie2_max_col, ndev->aie.metadata.cols);
+	XDNA_INFO(ndev->aie.xdna, "total_col=%d (aie2_max_col=%d, fw_metadata.cols=%d, patches=%d)",
+		  ndev->total_col, aie2_max_col, ndev->aie.metadata.cols, fw_patches_enable);
 
 	return 0;
 }

@@ -33,13 +33,18 @@
 
 /*
  * Firmware patching: module parameter to enable VE2 IPU firmware patching.
- * Patches bypass the "last scheduled application" serialization gate in the
- * VE2 IPU firmware, enabling multi-application NPU access.  Disabled by
- * default for safety (patches are VE2-firmware-specific).
+ * When enabled, patches the VE2 IPU firmware's column_config to expose
+ * all 40 physically available AIE columns instead of the default 8.
+ * Disabled by default for safety (patches are VE2-firmware-specific).
+ *
+ * NOTE: Multi-app gate bypass (offsets 0x2DD8-0x2DF7) was removed because
+ * those offsets are a data table of 32-bit relative values in firmware
+ * 1.1.2.65, not function pointers. Zeroing them crashes the firmware.
  */
-static bool fw_patches_enable;
+bool fw_patches_enable;
+EXPORT_SYMBOL(fw_patches_enable);
 module_param(fw_patches_enable, bool, 0644);
-MODULE_PARM_DESC(fw_patches_enable, "Enable VE2 IPU firmware patches (bypass app serialization gate)");
+MODULE_PARM_DESC(fw_patches_enable, "Enable VE2 IPU firmware patches (unlock 40 columns)");
 
 /*
  * Tracking: whether PSP cmd #3 is actually issued.
@@ -89,21 +94,22 @@ struct aie_fw_patch {
 
 /*
  * VE2 (NPU5/Strix Halo) IPU firmware patches.
- * Zeroes function-pointer table entries to bypass the "last scheduled
- * application" serialization gate.  These entries at file offsets
- * 0x2DD8-0x2DF7 check whether the requesting application is the same
- * as the last one scheduled.  Zeroing them causes the VE2 IPU to
- * always fall through to the success path, enabling multi-application
- * NPU access.
+ *
+ * Column limit unlock (offsets 0x17B04, 0x17B10):
+ *   Modifies the VE2 IPU firmware's column_config structure to expose
+ *   all 40 physically available AIE columns instead of the default 8:
+ *     - 0x17B04: max_columns  0x00000008 -> 0x00000028 (8 -> 40)
+ *     - 0x17B10: flags        0x08000010 -> 0x28000010 (encodes max_col=40)
+ *   TOPS scales linearly with column count:
+ *     ~4096 * total_col * clock_freq / 1,000,000
  *
  * These offsets are VE2 IPU firmware-specific (npu_7.sbin for PCI
  * 17f0 rev 0x11).  Do NOT apply to other firmware versions.
  */
 static const struct aie_fw_patch ve2_fw_patches[] = {
-	{ 0x2DD8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
-	{ 0x2DE0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
-	{ 0x2DE8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
-	{ 0x2DF0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	/* Column limit unlock (8 -> 40 columns) */
+	{ 0x17B04, { 0x28, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF } },
+	{ 0x17B10, { 0x10, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00 } },
 };
 
 /*
@@ -142,9 +148,8 @@ static void aie_apply_fw_patches(struct psp_device *psp, u64 buf_offset)
 		memcpy(buf + p->offset, p->data, sizeof(p->data));
 	}
 
-	drm_info(psp->ddev, "Applied %zu VE2 firmware patches (%s)\n",
-		 ARRAY_SIZE(ve2_fw_patches),
-		 "multi-app gate bypass");
+	drm_info(psp->ddev, "Applied %zu VE2 firmware patches (40-col unlock)\n",
+		 ARRAY_SIZE(ve2_fw_patches));
 }
 
 static int psp_exec(struct psp_device *psp, u32 *reg_vals)
