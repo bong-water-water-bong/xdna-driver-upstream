@@ -171,12 +171,18 @@ int main(void)
 }
 EOF
 
-# Test struct drm_sched_init_args has num_rqs in 6.15+
+# Test drm_sched_init() new signature in 7.1+:
+# num_reqs was removed from this kernel
 try_compile HAVE_drm_sched_init_args_num_rqs << 'EOF'
 #include <drm/gpu_scheduler.h>
-_Static_assert(__builtin_offsetof(struct drm_sched_init_args, num_rqs) >= 0,
-	       "drm_sched_init_args has no num_rqs");
-int main(void) { return 0; }
+int main(void)
+{
+	struct drm_sched_init_args b = {
+		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
+	};
+
+	return 0;
+}
 EOF
 
 # Test iommu_dev_enable_feature()/iommu_dev_disable_feature() signature in 6.15-:
@@ -240,7 +246,7 @@ EOF
 # Test drm_gem_vmap()/drm_gem_vunmap signature in 6.16+:
 # int drm_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map)
 # void drm_gem_vunmap(struct drm_gem_object *obj, struct iosys_map *map)
-try_compile HAVE_drm_gem_vmap_vunmap << 'EOF'
+try_compile HAVE_6_16_drm_gem_vmap_vunmap << 'EOF'
 #include <drm/drm_gem.h>
 int main(void)
 {
@@ -251,6 +257,12 @@ int main(void)
 	(void)drm_gem_vunmap(a, b);
 	return 0;
 }
+EOF
+cat >> "$OUT" <<'EOF'
+#ifndef HAVE_6_16_drm_gem_vmap_vunmap
+#define drm_gem_vmap(bo, map)	drm_gem_vmap_unlocked(bo, map)
+#define drm_gem_vunmap(bo, map)	drm_gem_vunmap_unlocked(bo, map)
+#endif
 EOF
 
 # Test dma_buf_ops->cache_sgt_mapping in 6.15-:
@@ -306,6 +318,100 @@ int main(void)
 }
 EOF
 
+# Test kmalloc wrapper APIs (all introduced in 7.0):
+#   kzalloc_obj, kzalloc_flex, kmalloc_flex,
+#   kmalloc_objs, kzalloc_objs, kvzalloc_objs, kvmalloc_objs
+# One compilation test is sufficient since they were all added together.
+try_compile HAVE_7_0_kmalloc_ops << 'EOF'
+#include <linux/slab.h>
+int main(void)
+{
+	struct my_obj { int c; int data[]; };
+	struct my_obj *p;
+	int *q;
+
+	p = kzalloc_obj(*p);
+	p = kzalloc_flex(*p, data, 1);
+	p = kmalloc_flex(*p, data, 1);
+	q = kmalloc_objs(*q, 4);
+	q = kzalloc_objs(*q, 4);
+	q = kvzalloc_objs(*q, 4);
+	q = kvmalloc_objs(*q, 4);
+	return 0;
+}
+EOF
+cat >> "$OUT" <<'EOF'
+#ifndef HAVE_7_0_kmalloc_ops
+#define kzalloc_obj(obj)		kzalloc(sizeof(obj), GFP_KERNEL)
+#define kzalloc_flex(obj, member, n)	kzalloc(struct_size(&(obj), member, n), GFP_KERNEL)
+#define kmalloc_flex(obj, member, n)	kmalloc(struct_size(&(obj), member, n), GFP_KERNEL)
+#define kmalloc_objs(obj, n)		kmalloc_array(n, sizeof(obj), GFP_KERNEL)
+#define kzalloc_objs(obj, n)		kcalloc(n, sizeof(obj), GFP_KERNEL)
+#define kvzalloc_objs(obj, n)		kvcalloc(n, sizeof(obj), GFP_KERNEL)
+#define kvmalloc_objs(obj, n)		kvmalloc_array(n, sizeof(obj), GFP_KERNEL)
+#endif
+EOF
+
+# Test DRM_GPU_SCHED_STAT_NOMINAL name change
+# DRM_GPU_SCHED_STAT_NOMINAL changed to RESET
+try_compile HAVE_drm_gpu_sched_stat_reset << 'EOF'
+#include <drm/gpu_scheduler.h>
+int main(void)
+{
+	int a = DRM_GPU_SCHED_STAT_RESET;
+	return 0;
+}
+EOF
+
+# Test DRM_GPU_SCHED_STAT_NO_HANG availability (kernel >= 6.17)
+# Allows timedout_job to report "not hung" without triggering recovery
+try_compile HAVE_6_17_drm_gpu_sched_stat_no_hang << 'EOF'
+#include <drm/gpu_scheduler.h>
+int main(void)
+{
+	int a = DRM_GPU_SCHED_STAT_NO_HANG;
+	return 0;
+}
+EOF
+
+# Test drm_sched_start() with int errno parameter (6.13+ or backports):
+# void drm_sched_start(struct drm_gpu_scheduler *sched, int errno);
+# Use __builtin_types_compatible_p to force a hard error on type mismatch,
+# even when the kernel build does not enable -Werror.
+try_compile HAVE_6_13_drm_sched_start_errno << 'EOF'
+#include <drm/gpu_scheduler.h>
+typedef void (*expected_t)(struct drm_gpu_scheduler *, int);
+_Static_assert(__builtin_types_compatible_p(typeof(&drm_sched_start), expected_t),
+	       "drm_sched_start does not match (sched, int) signature");
+int main(void) { return 0; }
+EOF
+
+# Test drm_sched_start() with bool full_recovery parameter (pre-6.12):
+# void drm_sched_start(struct drm_gpu_scheduler *sched, bool full_recovery);
+try_compile HAVE_6_10_drm_sched_start_full_recovery << 'EOF'
+#include <drm/gpu_scheduler.h>
+typedef void (*expected_t)(struct drm_gpu_scheduler *, _Bool);
+_Static_assert(__builtin_types_compatible_p(typeof(&drm_sched_start), expected_t),
+	       "drm_sched_start does not match (sched, bool) signature");
+int main(void) { return 0; }
+EOF
+
+# Test BIT_U64 exists
+try_compile HAVE_6_16_bit_u64 << 'EOF'
+#include <linux/bits.h>
+int main(void)
+{
+	uint64_t a = BIT_U64(1);
+	return 0;
+}
+EOF
+cat >> "$OUT" <<'EOF'
+#ifndef HAVE_6_16_bit_u64
+#define BIT_U64(n)		BIT_ULL(n)
+#define GENMASK_U64(m, n)	GENMASK_ULL(m, n)
+#endif
+EOF
+
 # Test amd_pmf_get_npu_data exists
 try_compile HAVE_7_0_amd_pmf_get_npu_data << 'EOF'
 #include <linux/module.h>
@@ -332,6 +438,55 @@ int main(void)
 	info.npu_temp = 0;
 	return 0;
 }
+EOF
+
+#Test drm_fdinfo_print_size exists
+try_compile HAVE_6_14_drm_fdinfo_print_size << 'EOF'
+#include <drm/drm_file.h>
+int main(void)
+{
+	struct drm_printer *p = NULL;
+	drm_fdinfo_print_size(p, NULL, NULL, NULL, 0);
+}
+EOF
+cat >> "$OUT" <<'EOF'
+#ifndef HAVE_6_14_drm_fdinfo_print_size
+#define drm_fdinfo_print_size(p, prefix, stat, region, sz)		\
+	drm_printf(p, "%s-%s-%s:\t%llu KiB\n", prefix, stat, region,	\
+	(u64)(sz) / 1024)
+#endif
+EOF
+
+#Test drmm_alloc_ordered_workqueue exists
+try_compile HAVE_6_15_drmm_alloc_ordered_workqueue << 'EOF'
+#include <drm/drm_managed.h>
+int main(void)
+{
+	struct drm_device *dev = NULL;
+	drmm_alloc_ordered_workqueue(dev, "test", 0);
+}
+EOF
+cat >> "$OUT" << 'EOF'
+#ifndef HAVE_6_15_drmm_alloc_ordered_workqueue
+#include <drm/drm_device.h>
+#include <linux/workqueue.h>
+static inline void __drmm_workqueue_release(struct drm_device *device, void *res)
+{
+	struct workqueue_struct *wq = res;
+
+	destroy_workqueue(wq);
+}
+
+#define drmm_alloc_ordered_workqueue(dev, fmt, flags, args...)					\
+	({											\
+		struct workqueue_struct *wq = alloc_ordered_workqueue(fmt, flags, ##args);	\
+		wq ? ({										\
+			int ret = drmm_add_action_or_reset(dev, __drmm_workqueue_release, wq);	\
+			ret ? ERR_PTR(ret) : wq;						\
+		}) :										\
+			wq;									\
+	})
+#endif
 EOF
 
 # ---- Header trailer ----------------------------------------------------
