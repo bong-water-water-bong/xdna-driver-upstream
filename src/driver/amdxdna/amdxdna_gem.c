@@ -400,7 +400,7 @@ void *amdxdna_gem_vmap(struct amdxdna_gem_obj *abo)
 #ifdef HAVE_drm_gem_vmap_vunmap
 		ret = drm_gem_vmap(to_gobj(abo), &map);
 #else
-		ret = drm_gem_vmap_unlocked(to_gobj(abo), &map);
+		ret = drm_gem_vmap(to_gobj(abo), &map);
 #endif
 		if (ret)
 			XDNA_ERR(abo->client->xdna, "Vmap bo failed, ret %d", ret);
@@ -462,7 +462,7 @@ static void amdxdna_gem_vunmap(struct amdxdna_gem_obj *abo)
 #ifdef HAVE_drm_gem_vmap_vunmap
 	drm_gem_vunmap(to_gobj(abo), &map);
 #else
-	drm_gem_vunmap_unlocked(to_gobj(abo), &map);
+	drm_gem_vunmap(to_gobj(abo), &map);
 #endif
 
 	abo->mem.kva = NULL;

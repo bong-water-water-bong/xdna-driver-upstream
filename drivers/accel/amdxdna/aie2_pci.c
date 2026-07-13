@@ -444,7 +444,7 @@ stop_psp:
 	aie_psp_stop(ndev->aie.psp_hdl);
 	goto fini_smu;
 stop_psp_no_smu:
-	/* SMU not initialized yet -- skip SMU fini; still stop PSP */
+	/* SMU not initialized yet -- skip SMU fini */
 	aie_psp_stop(ndev->aie.psp_hdl);
 	goto free_channel;
 fini_smu:

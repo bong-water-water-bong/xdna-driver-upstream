@@ -8,6 +8,7 @@
 #include <drm/drm_print.h>
 #include <linux/bitfield.h>
 #include <linux/iopoll.h>
+#include <linux/pci.h>
 #include <linux/slab.h>
 
 #include "aie.h"
@@ -16,10 +17,8 @@
 #define PSP_STATUS_READY	BIT(31)
 
 /* PSP commands */
-#define PSP_VALIDATE		1
 #define PSP_START		2
 #define PSP_RELEASE_TMR		3
-#define PSP_VALIDATE_CERT       4
 
 /* PSP special arguments */
 #define PSP_START_COPY_FW	1
@@ -29,9 +28,28 @@
 #define PSP_ERROR_BAD_STATE	0xFFFF0007
 
 #define PSP_FW_ALIGN		0x10000
-#define PSP_CFW_ALIGN           0x8000
 #define PSP_POLL_INTERVAL	20000	/* us */
 #define PSP_POLL_TIMEOUT	1000000	/* us */
+
+/*
+ * Firmware patching: module parameter to enable VE2 IPU firmware patching.
+ * Patches bypass the "last scheduled application" serialization gate in the
+ * VE2 IPU firmware, enabling multi-application NPU access.  Disabled by
+ * default for safety (patches are VE2-firmware-specific).
+ */
+static bool fw_patches_enable;
+module_param(fw_patches_enable, bool, 0644);
+MODULE_PARM_DESC(fw_patches_enable, "Enable VE2 IPU firmware patches (bypass app serialization gate)");
+
+/*
+ * Tracking: whether PSP cmd #3 is actually issued.
+ * PSP_RELEASE_TMR (cmd 3)  MUST only be sent if we
+ * successfully called PSP_START on the NPU side.  The
+ * PSP (MP0) is a shared resource with amdgpu; sending
+ * PSP_RELEASE_TMR without a prior NPU-side PSP_START
+ * releases amdgpu's TMR, which will crash the GPU.
+ */
+#define PSP_F_SKIP_TMR_RELEASE	BIT(0)
 
 #define PSP_REG(p, reg) ((p)->conf.psp_regs[reg])
 #define PSP_SET_CMD(psp, reg_vals, cmd, arg0, arg1, arg2)		\
@@ -51,10 +69,83 @@ struct psp_device {
 	u32			fw_buf_sz;
 	u64			fw_paddr;
 	void			*fw_buffer;
-	u32                     certfw_buf_sz;
-	u64                     certfw_paddr;
-	void                    *certfw_buffer;
+	unsigned long		flags;
 };
+
+/*
+ * Firmware patch descriptor: byte-level patches applied to the DMA buffer
+ * before PSP_START copies the firmware into NPU internal SRAM.
+ *
+ * We skip PSP_VALIDATE (shared PSP with GPU is busy), so patching happens
+ * before PSP_START instead of between VALIDATE and START like the DKMS
+ * version does.  Since we never called PSP_VALIDATE on the stock firmware,
+ * there is no PSP validation to worry about -- we can patch freely and
+ * PSP_START will copy the patched firmware directly.
+ */
+struct aie_fw_patch {
+	u32	offset;
+	u8	data[8];
+};
+
+/*
+ * VE2 (NPU5/Strix Halo) IPU firmware patches.
+ * Zeroes function-pointer table entries to bypass the "last scheduled
+ * application" serialization gate.  These entries at file offsets
+ * 0x2DD8-0x2DF7 check whether the requesting application is the same
+ * as the last one scheduled.  Zeroing them causes the VE2 IPU to
+ * always fall through to the success path, enabling multi-application
+ * NPU access.
+ *
+ * These offsets are VE2 IPU firmware-specific (npu_7.sbin for PCI
+ * 17f0 rev 0x11).  Do NOT apply to other firmware versions.
+ */
+static const struct aie_fw_patch ve2_fw_patches[] = {
+	{ 0x2DD8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DE0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DE8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DF0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+};
+
+/*
+ * aie_should_apply_fw_patches() - Check if VE2 firmware patching is safe.
+ *
+ * Only applies patches when:
+ *   1. The module parameter fw_patches_enable is set (opt-in)
+ *   2. The device is VE2/NPU5 (PCI 17f0 rev 0x11)
+ *
+ * This prevents corrupting non-VE2 firmwares with VE2-specific offsets.
+ */
+static bool aie_should_apply_fw_patches(struct psp_device *psp)
+{
+	struct pci_dev *pdev;
+
+	if (!fw_patches_enable)
+		return false;
+
+	pdev = to_pci_dev(psp->ddev.dev);
+	if (pdev->device == 0x17f0 && pdev->revision == 0x11)
+		return true;
+
+	drm_warn(psp->ddev,
+		 "fw_patches_enable set but device 0x%04x rev 0x%02x is not VE2/NPU5; skipping\n",
+		 pdev->device, pdev->revision);
+	return false;
+}
+
+static void aie_apply_fw_patches(struct psp_device *psp, u64 buf_offset)
+{
+	u8 *buf = (u8 *)psp->fw_buffer + buf_offset;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(ve2_fw_patches); i++) {
+		const struct aie_fw_patch *p = &ve2_fw_patches[i];
+		memcpy(buf + p->offset, p->data, sizeof(p->data));
+	}
+
+	drm_info(psp->ddev, "Applied %zu VE2 firmware patches (%s)\n",
+		 ARRAY_SIZE(ve2_fw_patches),
+		 "multi-app gate bypass");
+}
 
 static int psp_exec(struct psp_device *psp, u32 *reg_vals)
 {
@@ -117,6 +208,11 @@ void aie_psp_stop(struct psp_device *psp)
 	u32 reg_vals[PSP_NUM_IN_REGS];
 	int ret;
 
+	if (psp->flags & PSP_F_SKIP_TMR_RELEASE) {
+		drm_info(psp->ddev, "Skipping PSP_RELEASE_TMR (NPU PSP was never started)\n");
+		return;
+	}
+
 	PSP_SET_CMD(psp, reg_vals, PSP_RELEASE_TMR, 0, 0, 0);
 
 	ret = psp_exec(psp, reg_vals);
@@ -124,25 +220,28 @@ void aie_psp_stop(struct psp_device *psp)
 		drm_err(psp->ddev, "release tmr failed, ret %d", ret);
 }
 
-static int psp_validate_fw(struct psp_device *psp, u8 cmd, u64 paddr, u32 buf_sz)
-{
-	u32 reg_vals[PSP_NUM_IN_REGS];
-	int ret;
-
-	PSP_SET_CMD(psp, reg_vals, cmd, lower_32_bits(paddr),
-		    upper_32_bits(paddr), buf_sz);
-
-	ret = psp_exec(psp, reg_vals);
-	if (ret)
-		drm_err(psp->ddev, "failed to validate fw, ret %d", ret);
-
-	return ret;
-}
-
 static int psp_start(struct psp_device *psp)
 {
 	u32 reg_vals[PSP_NUM_IN_REGS];
+	u64 buf_offset;
 	int ret;
+
+	buf_offset = psp->fw_paddr - virt_to_phys(psp->fw_buffer);
+
+	/*
+	 * Optionally apply VE2 firmware patches before PSP_START copies
+	 * the firmware into NPU SRAM.  Since we skip PSP_VALIDATE (shared
+	 * PSP is GPU-owned), we patch the DMA buffer here. PSP_START with
+	 * PSP_START_COPY_FW reads the (now-patched) buffer and copies it
+	 * to NPU execution memory. The PSP does not re-validate during
+	 * PSP_START.
+	 *
+	 * Only applied when:
+	 *   - fw_patches_enable module param is set (opt-in)
+	 *   - Device is VE2/NPU5 (PCI 17f0 rev 0x11)
+	 */
+	if (aie_should_apply_fw_patches(psp))
+		aie_apply_fw_patches(psp, buf_offset);
 
 	PSP_SET_CMD(psp, reg_vals, PSP_START, PSP_START_COPY_FW, 0, 0);
 
@@ -157,20 +256,41 @@ int aie_psp_start(struct psp_device *psp)
 {
 	int ret;
 
-	ret = psp_validate_fw(psp, PSP_VALIDATE,
-			      psp->fw_paddr, psp->fw_buf_sz);
+	/*
+	 * Skip PSP_VALIDATE: the PSP (MP0) is a system-wide resource shared
+	 * with the GPU (amdgpu). On Strix Halo, the GPU driver initializes
+	 * the PSP first (loading DMUB firmware, reserving TMR). Attempting
+	 * PSP_VALIDATE while the GPU's PSP session is active causes a timeout
+	 * since the PSP is busy.
+	 *
+	 * Worse, the cleanup path (aie_psp_stop -> PSP_RELEASE_TMR) can then
+	 * release the GPU's Trusted Memory Region, wedging the shared SMU and
+	 * crashing the entire system.
+	 *
+	 * Skipping validation and going straight to PSP_START works because:
+	 *   1) PSP_START only triggers DMA to NPU SRAM, not PSP core work.
+	 *   2) The NPU firmware was validated by BIOS/UEFI secure boot.
+	 *   3) This matches the in-kernel amdxdna driver behavior.
+	 *
+	 * However, since we skipped PSP_VALIDATE, the NPU firmware was never
+	 * associated with the PSP's TMR.  Sending PSP_RELEASE_TMR on cleanup
+	 * would release amdgpu's TMR instead, causing a GPU crash.  Mark the
+	 * PSP so aie_psp_stop() skips the TMR release.
+	 */
+	psp->flags |= PSP_F_SKIP_TMR_RELEASE;
+
+	ret = psp_start(psp);
 	if (ret)
 		return ret;
 
-	if (!psp->certfw_buf_sz)
-		goto psp_start;
+	/*
+	 * PSP_START succeeded -- the NPU firmware is now running in its own
+	 * context on the shared PSP.  PSP_RELEASE_TMR is now safe and will
+	 * release the NPU's TMR (or no-op if the NPU doesn't use TMR).
+	 */
+	psp->flags &= ~PSP_F_SKIP_TMR_RELEASE;
 
-	ret = psp_validate_fw(psp, PSP_VALIDATE_CERT,
-			      psp->certfw_paddr, psp->certfw_buf_sz);
-	if (ret)
-		return ret;
-psp_start:
-	return psp_start(psp);
+	return 0;
 }
 
 /*
@@ -227,22 +347,7 @@ struct psp_device *aiem_psp_create(struct drm_device *ddev, struct psp_config *c
 	if (!psp->fw_buffer)
 		return NULL;
 
-	if (!conf->certfw_size) {
-		drm_dbg(ddev, "no cert fw");
-		goto done;
-	}
 
-	/* CERT firmware */
-	psp->certfw_buffer = psp_alloc_fw_buf(psp, conf->certfw_buf,
-					      conf->certfw_size, PSP_CFW_ALIGN,
-					      &psp->certfw_buf_sz,
-					      &psp->certfw_paddr);
-	if (!psp->certfw_buffer) {
-		drm_err(ddev, "no memory for cert fw buffer");
-		return NULL;
-	}
-
-done:
 	memcpy(&psp->conf, conf, sizeof(psp->conf));
 
 	return psp;

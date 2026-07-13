@@ -1,4 +1,16 @@
 # ignore the folder called build anywhere, but not files called build
 build/
+build_x/
 version.h
 .gradle/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+*.cmd
+Module.symvers
+modules.order
+config_kernel.h
