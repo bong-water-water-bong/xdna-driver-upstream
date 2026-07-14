@@ -386,20 +386,23 @@ static int aie2_hw_start(struct amdxdna_dev *xdna)
 	pci_set_master(pdev);
 
 	/*
-	 * aie2_smu_start(), aie2_pm_init() and aie2_mgmt_fw_init() require
-	 * aie2_lock. One mutex_lock() and mutex_unlock() is simpler.
+	 * Strix Halo (NPU5/VE2) requires PSP to be started before SMU.
+	 * The PSP is shared with amdgpu; starting it first ensures the NPU
+	 * firmware load sequence doesn't conflict with the GPU's PSP session.
+	 * aie2_pm_init() and aie2_mgmt_fw_init() require aie2_lock.
+	 * One mutex_lock() and mutex_unlock() is simpler.
 	 */
 	mutex_lock(&ndev->aie2_lock);
-	ret = aie2_smu_start(ndev);
-	if (ret) {
-		XDNA_ERR(xdna, "failed to init smu, ret %d", ret);
-		goto disable_dev;
-	}
-
 	ret = aie2_psp_start(ndev->psp_hdl);
 	if (ret) {
 		XDNA_ERR(xdna, "failed to start psp, ret %d", ret);
-		goto fini_smu;
+		goto disable_dev;
+	}
+
+	ret = aie2_smu_start(ndev);
+	if (ret) {
+		XDNA_ERR(xdna, "failed to init smu, ret %d", ret);
+		goto stop_psp_only;
 	}
 
 	ret = aie2_mgmt_chann_init(ndev);
@@ -466,9 +469,12 @@ destroy_mgmt_chann:
 destroy_mbox:
 	xdna_mailbox_destroy(ndev->mbox);
 	ndev->mbox = NULL;
+stop_psp_only:
+	aie2_psp_stop(ndev->psp_hdl);
+	goto disable_dev;
+
 stop_psp:
 	aie2_psp_stop(ndev->psp_hdl);
-fini_smu:
 	aie2_smu_stop(ndev);
 disable_dev:
 	mutex_unlock(&ndev->aie2_lock);
@@ -659,7 +665,6 @@ static void aie2_fini(struct amdxdna_dev *xdna)
 
 	aie2_rq_fini(&ndev->ctx_rq);
 	aie2_hw_stop(xdna);
-	aie2_psp_destroy(&pdev->dev, ndev->psp_hdl);
 #ifdef AMDXDNA_DEVEL
 	if (iommu_mode != AMDXDNA_IOMMU_PASID)
 		goto skip_pasid;
